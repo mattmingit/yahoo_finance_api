@@ -159,14 +159,15 @@ fn main() {
 "
 )]
 
+use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
 
 #[cfg(feature = "blocking")]
 use reqwest::blocking::{Client, ClientBuilder};
-use reqwest::StatusCode;
 #[cfg(not(feature = "blocking"))]
 use reqwest::{Client, ClientBuilder};
+use reqwest::{Proxy, StatusCode};
 
 // re-export time crate
 pub use quotes::decimal::Decimal;
@@ -176,8 +177,10 @@ mod quotes;
 mod search_result;
 mod yahoo_error;
 pub use quotes::{
-    AdjClose, CapitalGain, Dividend, PeriodInfo, Quote, QuoteBlock, QuoteList, Split,
-    TradingPeriods, YChart, YMetaData, YQuoteBlock, YResponse,
+    AdjClose, AssetProfile, CapitalGain, CurrentTradingPeriod, DefaultKeyStatistics, Dividend,
+    ExtendedQuoteSummary, FinancialData, PeriodInfo, Quote, QuoteBlock, QuoteList, QuoteType,
+    Split, SummaryDetail, TradingPeriods, YChart, YMetaData, YQuoteBlock, YQuoteSummary, YResponse,
+    YSummaryData,
 };
 pub use search_result::{
     YNewsItem, YOptionChain, YOptionChainData, YOptionChainResult, YOptionContract, YOptionDetails,
@@ -187,6 +190,12 @@ pub use yahoo_error::YahooError;
 
 const YCHART_URL: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 const YSEARCH_URL: &str = "https://query2.finance.yahoo.com/v1/finance/search";
+const Y_GET_COOKIE_URL: &str = "https://fc.yahoo.com";
+const Y_GET_CRUMB_URL: &str = "https://query1.finance.yahoo.com/v1/test/getcrumb";
+
+// special yahoo hardcoded keys and headers
+const Y_COOKIE_REQUEST_HEADER: &str = "set-cookie";
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 // Macros instead of constants,
 macro_rules! YCHART_PERIOD_QUERY {
@@ -194,14 +203,19 @@ macro_rules! YCHART_PERIOD_QUERY {
         "{url}/{symbol}?symbol={symbol}&period1={start}&period2={end}&interval={interval}&events=div|split|capitalGains"
     };
 }
-macro_rules! YCHART_RANGE_QUERY {
+macro_rules! YCHART_PERIOD_QUERY_PRE_POST {
     () => {
-        "{url}/{symbol}?symbol={symbol}&interval={interval}&range={range}&events=div|split|capitalGains"
+        "{url}/{symbol}?symbol={symbol}&period1={start}&period2={end}&interval={interval}&events=div|split|capitalGains&includePrePost={prepost}"
     };
+}
+macro_rules! YCHART_RANGE_QUERY {
+  () => {
+    "{url}/{symbol}?symbol={symbol}&interval={interval}&range={range}&events=div|split|capitalGains"
+  };
 }
 macro_rules! YCHART_PERIOD_INTERVAL_QUERY {
     () => {
-        "{url}/{symbol}?symbol={symbol}&period={period}&interval={interval}&includePrePost={prepost}"
+        "{url}/{symbol}?symbol={symbol}&range={range}&interval={interval}&includePrePost={prepost}"
     };
 }
 macro_rules! YTICKER_QUERY {
@@ -209,17 +223,30 @@ macro_rules! YTICKER_QUERY {
         "{url}?q={name}"
     };
 }
+macro_rules! YQUOTE_SUMMARY_QUERY {
+    () => {
+        "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=financialData,quoteType,defaultKeyStatistics,assetProfile,summaryDetail&corsDomain=finance.yahoo.com&formatted=false&symbol={symbol}&crumb={crumb}"
+    }
+}
 
 /// Container for connection parameters to yahoo! finance server
 pub struct YahooConnector {
     client: Client,
     url: &'static str,
     search_url: &'static str,
+    timeout: Option<Duration>,
+    user_agent: Option<String>,
+    proxy: Option<Proxy>,
+    cookie: Option<String>,
+    crumb: Option<String>,
 }
 
 #[derive(Default)]
 pub struct YahooConnectorBuilder {
     inner: ClientBuilder,
+    timeout: Option<Duration>,
+    user_agent: Option<String>,
+    proxy: Option<Proxy>,
 }
 
 impl YahooConnector {
@@ -231,6 +258,8 @@ impl YahooConnector {
     pub fn builder() -> YahooConnectorBuilder {
         YahooConnectorBuilder {
             inner: Client::builder(),
+            user_agent: Some(USER_AGENT.to_string()),
+            ..Default::default()
         }
     }
 }
@@ -241,29 +270,60 @@ impl Default for YahooConnector {
             client: Client::default(),
             url: YCHART_URL,
             search_url: YSEARCH_URL,
+            timeout: None,
+            user_agent: Some(USER_AGENT.to_string()),
+            proxy: None,
+            cookie: None,
+            crumb: None,
         }
     }
 }
 
 impl YahooConnectorBuilder {
-    pub fn build(self) -> Result<YahooConnector, YahooError> {
-        self.build_with_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-    }
-
-    pub fn build_with_agent(self, user_agent: &str) -> Result<YahooConnector, YahooError> {
-        let client = Client::builder().user_agent(user_agent).build()?;
-
-        Ok(YahooConnector {
-            client,
-            url: YCHART_URL,
-            search_url: YSEARCH_URL,
-        })
+    pub fn new() -> Self {
+        YahooConnector::builder()
     }
 
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.inner = self.inner.timeout(timeout);
-
+        self.timeout = Some(timeout);
         self
+    }
+
+    pub fn user_agent(mut self, user_agent: &str) -> Self {
+        self.user_agent = Some(user_agent.to_string());
+        self
+    }
+
+    pub fn proxy(mut self, proxy: Proxy) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
+
+    pub fn build(mut self) -> Result<YahooConnector, YahooError> {
+        if let Some(timeout) = &self.timeout {
+            self.inner = self.inner.timeout(timeout.clone());
+        }
+        if let Some(user_agent) = &self.user_agent {
+            self.inner = self.inner.user_agent(user_agent.clone());
+        }
+        if let Some(proxy) = &self.proxy {
+            self.inner = self.inner.proxy(proxy.clone());
+        }
+
+        Ok(YahooConnector {
+            client: self.inner.build()?,
+            timeout: self.timeout,
+            user_agent: self.user_agent,
+            proxy: self.proxy,
+            ..Default::default()
+        })
+    }
+
+    pub fn build_with_client(client: Client) -> Result<YahooConnector, YahooError> {
+        Ok(YahooConnector {
+            client,
+            ..Default::default()
+        })
     }
 }
 
